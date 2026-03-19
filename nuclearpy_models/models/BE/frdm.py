@@ -6,8 +6,7 @@ import glob
 
 # path to tis file
 FILEPATH = os.path.abspath(__file__)
-PATH_2_DATA = "../../Data/Theory/FRDM2012.csv"
-print(glob.glob(PATH_2_DATA))
+PATH_2_DATA = os.path.abspath(os.path.join(os.path.dirname(FILEPATH), "../../../Data/Theory/FRDM2012.csv"))
 
 
 class FRDM:
