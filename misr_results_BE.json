@@ -1,0 +1,43 @@
+{
+  "target": "BE",
+  "hyperparameters": {
+    "k": 2,
+    "s": 7,
+    "maxiter": 1,
+    "theta": 0.01,
+    "sr_pop": 500,
+    "sr_gen": 20,
+    "sr_parsimony": 0.01
+  },
+  "equations": [
+    {
+      "iteration": 1,
+      "equation": "add(mul(A, log(add(mul(A, sqrt(A)), mul(A, neg(div(N, -0.524)))))), sub(sub(mul(sub(log(mul(A, sqrt(A))), P), log(add(log(P), sub(sub(mul(mul(A, sqrt(A)), mul(P, div(sub(mul(A, sqrt(A)), N), P))), A), N)))), A), N))",
+      "selected_features": [
+        "A",
+        "N",
+        "Z",
+        "Nn",
+        "Np",
+        "P",
+        "I"
+      ],
+      "fitness": 1721.5644234378506,
+      "val_rmse": 47.13920906989124,
+      "residual_rmse": 44.40534570956951,
+      "improvement_ratio": 0.9395838164983421,
+      "test_rmse": 277.2489601030232,
+      "test_mae": 187.48436573108697,
+      "test_r2": 0.7033210058676725
+    }
+  ],
+  "final_model": "(add(mul(A, log(add(mul(A, sqrt(A)), mul(A, neg(div(N, -0.524)))))), sub(sub(mul(sub(log(mul(A, sqrt(A))), P), log(add(log(P), sub(sub(mul(mul(A, sqrt(A)), mul(P, div(sub(mul(A, sqrt(A)), N), P))), A), N)))), A), N)))",
+  "iteration_metrics": [
+    {
+      "iteration": 1,
+      "residual_rmse": 44.40534570956951,
+      "test_rmse": 277.2489601030232,
+      "improvement_ratio": 0.9395838164983421
+    }
+  ]
+}
