@@ -2,7 +2,7 @@ WITH "CTE_LastValidation_Time" AS (SELECT "XLA_TRANSACTION_ENTITIES"."Transactio
                                           ROW_NUMBER()
                                           OVER (PARTITION BY "XLA_TRANSACTION_ENTITIES"."TransactionSourceIdInt1"
                                               ORDER BY "XLA_EVENTS"."EventPEOCreationDate" ASC, "XLA_EVENTS"."EventPEOEventNumber" DESC) AS "rn",
-                                          CAST("XLA_EVENTS"."EventPEOEventDate" AS TIMESTAMP)                                            AS "LastValidationTime",
+                                          CAST("XLA_EVENTS"."EventPEOCreationDate" AS TIMESTAMP)                                         AS "LastValidationTime",
                                           "XLA_EVENTS"."EventPEOEventId"                                                                 AS "EVENT_ID",
                                           "XLA_EVENTS"."EventPEOEventPEOCreatedBy"                                                       AS "CREATED_BY"
                                    FROM "FscmTopModelAM_FinExtractAM_XlaBiccExtractAM_SubledgerJournalTransactionEntityExtractPVO" AS "XLA_TRANSACTION_ENTITIES"
@@ -14,8 +14,7 @@ WITH "CTE_LastValidation_Time" AS (SELECT "XLA_TRANSACTION_ENTITIES"."Transactio
                                    WHERE "XLA_TRANSACTION_ENTITIES"."TransactionEntityCode" = 'AP_INVOICES'
                                      AND "XLA_TRANSACTION_ENTITIES"."TransactionApplicationId" = 200
                                      AND "XLA_EVENTS"."EventPEOEventStatusCode" = 'P'
-                                     AND "XLA_EVENTS"."EventPEOEventTypeCode" IN ('CREDIT MEMO CANCELLED',
-                                                                                  'DEBIT MEMO CANCELLED')),
+                                     AND "XLA_EVENTS"."EventPEOEventTypeCode" = 'INVOICE VALIDATED'),
      "CTE_LastValidation" AS (SELECT "LastValTime"."INVOICE_ID",
                                      "LastValTime"."LastValidationTime",
                                      "LastValTime"."CREATED_BY",
@@ -116,7 +115,7 @@ WITH "CTE_LastValidation_Time" AS (SELECT "XLA_TRANSACTION_ENTITIES"."Transactio
 SELECT <%=sourceSystem%>  || 'VendorAccountCreditItem_' || "AP_PAYMENT_SCHEDULES_ALL"."ApPaymentSchedulesAllInvoiceId" || '_'
        || "AP_PAYMENT_SCHEDULES_ALL"."ApPaymentSchedulesAllPaymentNum"                                 AS "ID",
        "LastValidation"."LastValidationTime"                                                           AS "CreationTime",
-	<%=sourceSystem%>  || 'User_' || "AP_PAYMENT_SCHEDULES_ALL"."ApPaymentSchedulesAllCreatedBy"          AS "CreatedBy",
+	<%=sourceSystem%>  || 'User_' || "LastValidation"."CREATED_BY"                                        AS "CreatedBy",
        CASE
            WHEN "AP_INVOICES_ALL"."ApInvoicesSource" = 'Manual Invoice Entry'
                THEN 'Manual'
@@ -171,7 +170,7 @@ SELECT <%=sourceSystem%>  || 'VendorAccountCreditItem_' || "AP_PAYMENT_SCHEDULES
 	<%=sourceSystem%>  || 'Vendor_' || "AP_INVOICES_ALL"."ApInvoicesVendorSiteId"                         AS "Vendor",
        CAST(COALESCE("TERMS"."DISCOUNT_PERCENT1", 0.0) AS DOUBLE)                                      AS "VendorCashDiscountPercentage1",
        CAST(COALESCE("TERMS"."DISCOUNT_PERCENT2", 0.0) AS DOUBLE)                                      AS "VendorCashDiscountPercentage2",
-       "AP_INVOICES_ALL"."ApInvoicesInvoiceAmount"                                                     AS "Amount",
+       "AP_PAYMENT_SCHEDULES_ALL"."ApPaymentSchedulesAllInvCurrGrossAmount"                            AS "Amount",
        "AP_INVOICES_ALL"."ApInvoicesInvoiceCurrencyCode"                                               AS "Currency",
        COALESCE("AGG_INV_PAYM"."DISCOUNT_TAKEN", 0)                                                    AS "CashDiscountTakenAmount",
        COALESCE("AP_INVOICES_ALL"."ApInvoicesAmountApplicableToDiscount", 0)                           AS "CashDiscountEligibleAmount",
@@ -247,7 +246,8 @@ SELECT <%=sourceSystem%>  || 'VendorAccountCreditItem_' || "AP_PAYMENT_SCHEDULES
                                           TIMESTAMPADD(MONTH, CAST("TERMS"."DISCOUNT_MONTHS_FORWARD1" AS INTEGER),
                                                        CAST(YEAR("AP_INVOICES_ALL"."ApInvoicesTermsDate") || '-'
                                                             || MONTH(
-                                                                    "AP_INVOICES_ALL"."ApInvoicesTermsDate") || '-'
+                                                                    "AP_INVOICES_ALL"."ApInvoicesTermsDate")
+                                                            || '-'
                                                             || CAST("TERMS"."DISCOUNT_DAY_OF_MONTH1" AS INTEGER) AS TIMESTAMP))
                                       END)
            ELSE 0
@@ -287,7 +287,8 @@ SELECT <%=sourceSystem%>  || 'VendorAccountCreditItem_' || "AP_PAYMENT_SCHEDULES
                                                                     CAST("TERMS"."DUE_MONTHS_FORWARD" AS INTEGER),
                                                                     CAST(YEAR("AP_INVOICES_ALL"."ApInvoicesTermsDate")
                                                                          || '-'
-                                                                         || MONTH("AP_INVOICES_ALL"."ApInvoicesTermsDate")
+                                                                         || MONTH(
+                                                                                 "AP_INVOICES_ALL"."ApInvoicesTermsDate")
                                                                          || '-'
                                                                          || CAST("TERMS"."DUE_DAY_OF_MONTH" AS INTEGER) AS TIMESTAMP))
                                                    END)
@@ -304,8 +305,8 @@ SELECT <%=sourceSystem%>  || 'VendorAccountCreditItem_' || "AP_PAYMENT_SCHEDULES
                                                                                 CAST("TERMS"."DISCOUNT_MONTHS_FORWARD2" AS INTEGER)
                                                                                 + 1,
                                                                                 CAST(YEAR("AP_INVOICES_ALL"."ApInvoicesTermsDate")
-                                                                                     || '-'
-                                                                                     || MONTH("AP_INVOICES_ALL"."ApInvoicesTermsDate")
+                                                                                     || '-' || MONTH(
+                                                                                             "AP_INVOICES_ALL"."ApInvoicesTermsDate")
                                                                                      || '-01' AS TIMESTAMP))))
                                            <= CAST("TERMS"."DISCOUNT_DAY_OF_MONTH2" AS INTEGER)
                                           THEN TIMESTAMPADD(DAY, -1,
@@ -314,7 +315,8 @@ SELECT <%=sourceSystem%>  || 'VendorAccountCreditItem_' || "AP_PAYMENT_SCHEDULES
                                                                          + 1,
                                                                          CAST(YEAR("AP_INVOICES_ALL"."ApInvoicesTermsDate")
                                                                               || '-'
-                                                                              || MONTH("AP_INVOICES_ALL"."ApInvoicesTermsDate")
+                                                                              || MONTH(
+                                                                                      "AP_INVOICES_ALL"."ApInvoicesTermsDate")
                                                                               || '-01' AS TIMESTAMP)))
                                       ELSE
                                           TIMESTAMPADD(MONTH, CAST("TERMS"."DISCOUNT_MONTHS_FORWARD2" AS INTEGER),
@@ -369,10 +371,13 @@ SELECT <%=sourceSystem%>  || 'VendorAccountCreditItem_' || "AP_PAYMENT_SCHEDULES
        "PERIOD_LOOKUP"."PERIOD_YEAR"                                                                   AS "FiscalYear",
        CAST("AP_INVOICES_ALL"."ApInvoicesInvoiceNum" AS VARCHAR(255))                                  AS "SystemAccountingDocumentNumber",
        CAST("AP_INVOICES_ALL"."ApInvoicesInvoiceId" AS VARCHAR(255))                                   AS "DatabaseAccountingDocumentNumber",
-       'Reversal Document'                                                                             AS "ReversalIndicator",
+       CASE
+           WHEN "AP_INVOICES_ALL"."ApInvoicesCancelledDate" IS NOT NULL
+               THEN 'Reversed Document'
+           END                                                                                         AS "ReversalIndicator",
        CAST("AP_PAYMENT_SCHEDULES_ALL"."ApPaymentSchedulesAllPaymentNum" AS VARCHAR(255))              AS "SystemAccountingDocumentItemNumber",
        CAST("AP_PAYMENT_SCHEDULES_ALL"."ApPaymentSchedulesAllPaymentNum" AS VARCHAR(255))              AS "DatabaseAccountingDocumentItemNumber",
-       'ReverseCreditMemoItem'                                                                         AS "VendorAccountTransactionType",
+       'InvoiceItem'                                                                                   AS "VendorAccountTransactionType",
        COALESCE(CAST("AP_PAYMENT_SCHEDULES_ALL"."ApPaymentSchedulesAllSecondDiscountDate" AS TIMESTAMP),
                 CAST("AP_PAYMENT_SCHEDULES_ALL"."ApPaymentSchedulesAllDiscountDate" AS TIMESTAMP))     AS "CashDiscountDueDate",
        CAST("AP_PAYMENT_SCHEDULES_ALL"."ApPaymentSchedulesAllDueDate" AS TIMESTAMP)                    AS "DueDate",
@@ -386,11 +391,11 @@ FROM "FscmTopModelAM_FinExtractAM_ApBiccExtractAM_InvoicePaymentScheduleExtractP
          LEFT JOIN "FscmTopModelAM_FinExtractAM_ApBiccExtractAM_InvoiceHeaderExtractPVO" AS "AP_INVOICES_ALL"
                    ON "AP_PAYMENT_SCHEDULES_ALL"."ApPaymentSchedulesAllInvoiceId"
                       = "AP_INVOICES_ALL"."ApInvoicesInvoiceId"
-         LEFT JOIN "CTE_PORELATED" AS "PO_RELATED"
-                   ON "AP_INVOICES_ALL"."ApInvoicesInvoiceId" = "PO_RELATED"."INVOICE_ID"
          LEFT JOIN "CTE_AGG_INV_PAYM" AS "AGG_INV_PAYM"
                    ON "AP_INVOICES_ALL"."ApInvoicesInvoiceId" = "AGG_INV_PAYM"."INVOICE_ID"
                        AND "AP_PAYMENT_SCHEDULES_ALL"."ApPaymentSchedulesAllPaymentNum" = "AGG_INV_PAYM"."PAYMENT_NUM"
+         LEFT JOIN "CTE_PORELATED" AS "PO_RELATED"
+                   ON "AP_INVOICES_ALL"."ApInvoicesInvoiceId" = "PO_RELATED"."INVOICE_ID"
          LEFT JOIN "FscmTopModelAM_FinExtractAM_FunBiccExtractAM_BusinessUnitExtractPVO" AS "HR_ALL_ORGANIZATION_UNITS"
                    ON "AP_INVOICES_ALL"."ApInvoicesOrgId" = "HR_ALL_ORGANIZATION_UNITS"."FunBuPerfPEOBusinessUnitId"
          LEFT JOIN "FscmTopModelAM_FinExtractAM_AnalyticsExtractServiceAM_LookupValuesTLExtractPVO" AS "FND_LOOKUP_VALUES"
@@ -410,6 +415,6 @@ FROM "FscmTopModelAM_FinExtractAM_ApBiccExtractAM_InvoicePaymentScheduleExtractP
                    ON "AP_INVOICES_ALL"."ApInvoicesInvoiceId" = "LastValidation"."INVOICE_ID"
          LEFT JOIN "CTE_FullValidation" AS "FullValidation"
                    ON "AP_INVOICES_ALL"."ApInvoicesInvoiceId" = "FullValidation"."INVOICE_ID"
-WHERE "AP_INVOICES_ALL"."ApInvoicesInvoiceTypeLookupCode" IN ('CREDIT', 'DEBIT')
+WHERE "AP_INVOICES_ALL"."ApInvoicesInvoiceTypeLookupCode" = 'STANDARD'
   AND "LastValidation"."INVOICE_ID" IS NOT NULL
   AND "FullValidation"."INVOICE_ID" IS NOT NULL
