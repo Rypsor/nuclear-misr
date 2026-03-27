@@ -19,16 +19,20 @@ sample_test = test_df
 
 # 3. Configurar el modelo con parámetros balanceados
 model = MISR_Model(
-    maxiter=5,           
-    k_folds=5,           
-    population_size= 600, 
-    n_generations= 10,
-    s_features= 4  
+    maxiter=10,
+    k_folds=5,
+    population_size=1000,
+    n_generations=20,
+    s_features=4,
+    n_t=10,
+    beta_penalty=1e-3,
+    aux_weight=0.2,
+    random_state=42,
 )
 
 # 4. Ejecutar el entrenamiento
 print("Entrenando nuevo modelo MISR con sets explícitos...")
-model.fit(sample_train, sample_test)
+model.fit(sample_train, sample_test, target_col="BE", error_col="uBE")
 
 # Guardar el modelo entrenado
 joblib.dump(model, 'misr_model.pkl')
@@ -42,6 +46,9 @@ Extras_test = model.Extras_test # [Z, N]
 
 # Predicciones del nuevo modelo
 Y_pred_new = model.predict(pd.DataFrame(X_test_features, columns=model.feature_names))
+
+if Y_pred_new is None:
+    raise RuntimeError("MISR no generó predicciones. Verifique configuración de PySR.")
 
 # Predicciones del modelo del paper
 Y_pred_paper = []
@@ -60,11 +67,45 @@ def get_metrics(true, pred):
 rmse_new, mae_new = get_metrics(Y_true, Y_pred_new)
 rmse_paper, mae_paper = get_metrics(Y_true, Y_pred_paper)
 
+
+def order1_reference_be(N, Z):
+    """Ecuación de orden 1 reportada en context.md para BE."""
+    a = -1.10
+    b = 32.43
+    c = 16.70
+    eta0 = 1.0
+
+    N = np.asarray(N, dtype=float)
+    Z = np.asarray(Z, dtype=float)
+    A = N + Z
+    A_safe = np.where(A == 0, 1.0, A)
+    N_safe = np.where(N == 0, 1.0, N)
+    Z_safe = np.where(Z == 0, 1.0, Z)
+    I = (N - Z) / A_safe
+
+    term1 = Z_safe * (1.0 + 1.0 / N_safe - a * N_safe / (Z_safe ** 2))
+    term2 = I * (b - ((A_safe ** (1.0 / 3.0)) * N_safe / Z_safe)) + c
+    return eta0 * term1 * term2
+
+
+N_test_ctx = Extras_test[:, 1].astype(float)
+Z_test_ctx = Extras_test[:, 0].astype(float)
+be_order1_ref = order1_reference_be(N_test_ctx, Z_test_ctx)
+
+if model.models:
+    m0 = model.models[0]
+    alpha0 = float(m0.get("alpha", 1.0))
+    term1_pred = alpha0 * m0["model"].predict(X_test_features[:, m0["features"]])
+    mae_order1 = mean_absolute_error(be_order1_ref, term1_pred)
+else:
+    mae_order1 = np.nan
+
 print("\n" + "="*40)
 print(f"{'Métrica':<15} | {'Nuevo MISR':<12} | {'Paper SR'}")
 print("-" * 40)
 print(f"{'RMSE':<15} | {rmse_new:<12.4f} | {rmse_paper:.4f}")
 print(f"{'MAE':<15} | {mae_new:<12.4f} | {mae_paper:.4f}")
+print(f"{'MAE Ord-1 Ref':<15} | {mae_order1:<12.4f} | {'N/A'}")
 print("="*40)
 
 # Imprimir la expresión completa

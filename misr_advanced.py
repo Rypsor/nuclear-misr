@@ -1,12 +1,13 @@
+import inspect
+import copy
+import warnings
+
 import numpy as np
 import pandas as pd
+from pysr import PySRRegressor
 from sklearn.model_selection import train_test_split, KFold
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.feature_selection import mutual_info_regression
-from gplearn.genetic import SymbolicRegressor
-from gplearn.fitness import make_fitness
-import copy
-import warnings
 
 warnings.filterwarnings("ignore")
 
@@ -20,16 +21,32 @@ class MISR_Model:
     de la iteración anterior, optimizando múltiples objetivos físicos simultáneamente.
     """
     
-    def __init__(self, maxiter=10, theta=0.01, k_folds=5, s_features=5, n_generations=20, population_size=1000):
+    def __init__(
+        self,
+        maxiter=10,
+        theta=0.01,
+        k_folds=5,
+        s_features=5,
+        n_generations=20,
+        population_size=1000,
+        n_t=10,
+        beta_penalty=1e-3,
+        aux_weight=0.2,
+        random_state=42,
+    ):
         self.maxiter = maxiter
         self.theta = theta
         self.k_folds = k_folds
         self.s_features = s_features
         self.n_generations = n_generations
         self.population_size = population_size
+        self.n_t = n_t
+        self.beta_penalty = beta_penalty
+        self.aux_weight = aux_weight
+        self.random_state = random_state
         self.models = []         # Lista de submodelos (ecuaciones) ganadores por iteración
         self.uncertainties = []  # Incertidumbres (mu, sigma) asociadas a cada término mediante Jackknife
-        self.beta = 0.01         # Peso de la penalización por derivadas (L_penalty)
+        self.beta = 0.01         # Compatibilidad con código previo
         
         # Números mágicos para cálculo interno de características de vecinos
         self._z_magic = np.array([2, 8, 20, 28, 50, 82, 126])
@@ -40,8 +57,8 @@ class MISR_Model:
     # =========================================================================
     def calculate_features(self, df):
         """
-        Ingeniería de Características (X): Extrae directamente del dataset las 7 variables 
-        específicas {N, Z, A, I, P, Nn, Np}. No se realiza ningún cálculo manual interno.
+        Ingeniería de Características (X): retorna {N, Z, A, I, P, Nn, Np}.
+        Si faltan columnas derivadas, se calculan automáticamente desde N y Z.
         """
         df = df.copy()
         
@@ -51,15 +68,26 @@ class MISR_Model:
             if old_col in df.columns and new_col not in df.columns:
                 df[new_col] = df[old_col]
         
-        # Lista estricta de las 7 variables requeridas
         features = ['N', 'Z', 'A', 'I', 'P', 'Nn', 'Np']
-        
-        # Verificar que todas las columnas existan
-        missing = [c for c in features if c not in df.columns]
-        if missing:
-            raise KeyError(f"El dataset no contiene las variables requeridas: {missing}. "
-                           f"Asegúrese de que el CSV incluya estas columnas antes de entrenar.")
-        
+
+        # N y Z son obligatorias; el resto puede reconstruirse.
+        base_missing = [c for c in ['N', 'Z'] if c not in df.columns]
+        if base_missing:
+            raise KeyError(
+                f"El dataset no contiene las variables base requeridas: {base_missing}. "
+                f"Se requieren al menos columnas N y Z para reconstruir features derivadas."
+            )
+
+        N = df['N'].to_numpy(dtype=float)
+        Z = df['Z'].to_numpy(dtype=float)
+        computed = self._get_nucleus_features_numpy(N, Z)
+        computed_df = pd.DataFrame(computed, columns=features, index=df.index)
+
+        # Prioridad: usar dato del archivo si existe, y completar faltantes con el cálculo.
+        for col in features:
+            if col not in df.columns:
+                df[col] = computed_df[col]
+
         return df[features]
 
     def _get_nucleus_features_numpy(self, N, Z):
@@ -74,7 +102,18 @@ class MISR_Model:
             P = np.where((Nn + Np) > 0, (Nn * Np) / (Nn + Np), 0.0)
         return np.column_stack([N, Z, A, I, P, Nn, Np])
 
-    def preprocess_dataset(self, train_df, test_df=None, target_col='bindingEnergy(keV)', error_col='bindingEnergyUncertainty'):
+    def _resolve_column(self, df, preferred, alternatives, kind):
+        if preferred and preferred in df.columns:
+            return preferred
+        for candidate in alternatives:
+            if candidate in df.columns:
+                return candidate
+        raise KeyError(
+            f"No se encontró columna de {kind}. "
+            f"Preferida='{preferred}', alternativas={alternatives}."
+        )
+
+    def preprocess_dataset(self, train_df, test_df=None, target_col='BE', error_col=None):
         """
         Restricción, División de datos y Pre-cálculo de Vecinos para Multiobjetivo.
         """
@@ -95,12 +134,29 @@ class MISR_Model:
 
         def filter_and_extract(df):
             df_filt = df[(df['Z'] >= 12) & (df['Z'] <= 50)].copy()
-            df_filt = df_filt.dropna(subset=[target_col]).reset_index(drop=True)
+            target_name = self._resolve_column(
+                df_filt,
+                preferred=target_col,
+                alternatives=['BE', 'bindingEnergy(keV)'],
+                kind='target',
+            )
+            if error_col is None:
+                sigma_name = next(
+                    (c for c in ['uBE', 'bindingEnergyUncertainty'] if c in df_filt.columns),
+                    None,
+                )
+            else:
+                sigma_name = error_col if error_col in df_filt.columns else None
+
+            df_filt = df_filt.dropna(subset=[target_name]).reset_index(drop=True)
             
             # 1. Características Principales (Fieles al dataset)
             X_df = self.calculate_features(df_filt)
-            Y = df_filt[target_col].values
-            Sig = df_filt[error_col].values
+            Y = df_filt[target_name].values
+            if sigma_name is None:
+                Sig = np.ones(len(Y), dtype=float)
+            else:
+                Sig = df_filt[sigma_name].values
             
             # 2. Variables Auxiliares (Targets experimentales para multiobjetivo)
             Aux = {}
@@ -139,15 +195,38 @@ class MISR_Model:
 
         res_train = filter_and_extract(train_df)
         self.Mega_X_train, self.Y_train, self.Sigma_train, self.Aux_train, self.Ext_train = res_train
+        self.Extras_train = self.Ext_train
         self.feature_names = ['N', 'Z', 'A', 'I', 'P', 'Nn', 'Np']
 
         if test_df is not None:
             res_test = filter_and_extract(test_df)
             self.Mega_X_test, self.Y_test, self.Sigma_test, self.Aux_test, self.Ext_test = res_test
+            self.Extras_test = self.Ext_test
         
         # Atributos base para conveniencia
         self.X_train = self.Mega_X_train[:len(self.Y_train)]
         self.A_train = self.X_train[:, 2] # Columna A
+
+        if test_df is not None:
+            self.X_test = self.Mega_X_test[:len(self.Y_test)]
+            self.A_test = self.X_test[:, 2]
+
+        if test_df is None:
+            Xtr, Xte, ytr, yte, str_, ste, atr, ate, ext_tr, ext_te = train_test_split(
+                self.X_train,
+                self.Y_train,
+                self.Sigma_train,
+                self.Aux_train['be_per_A'],
+                self.Ext_train,
+                test_size=0.2,
+                random_state=self.random_state,
+            )
+            self.X_train, self.X_test = Xtr, Xte
+            self.Y_train, self.Y_test = ytr, yte
+            self.Sigma_train, self.Sigma_test = str_, ste
+            self.A_train, self.A_test = atr, ate
+            self.Ext_train, self.Ext_test = ext_tr, ext_te
+            self.Extras_train, self.Extras_test = ext_tr, ext_te
 
     # =========================================================================
     # 2. Definición de Variables Multiobjetivo
@@ -210,62 +289,49 @@ class MISR_Model:
     # =========================================================================
     # 4. Motor de Regresión Simbólica y Función de Pérdida
     # =========================================================================
-    def _create_multiobjective_metric(self, Y_exp, Sig_exp, Aux_exp, A_vals):
-        """
-        Crea una función de fitness personalizada para gplearn con el 100% de la lógica del paper.
-        """
+    def _evaluate_multiobjective_from_mega(self, y_pred_mega, Y_exp, Sig_exp, Aux_exp, A_vals):
         # Ponderación WMSE: 1/(1+sigma)^2
-        weights_exp = 1.0 / (1.0 + Sig_exp)**2
-        
+        weights_exp = 1.0 / (1.0 + Sig_exp) ** 2
+
         # Factores de normalización (1 / Varianza experimental para cada variable auxiliar)
         def get_norm(val):
             v = np.var(val)
             return 1.0 / (v + 1e-6) if v > 0 else 1.0
-            
-        norms = {k: get_norm(v) for k, v in Aux_exp.items()}
-        beta_val = self.beta
-        
-        def custom_fitness(y, y_pred, w):
-            # y_pred viene de evaluar el programa sobre Mega_X (12 * n muestras)
-            n = len(Y_exp)
-            p_actual = y_pred[:n]
-            p_n1 = y_pred[n:2*n]
-            p_n2 = y_pred[2*n:3*n]
-            p_z1 = y_pred[3*n:4*n]
-            p_z2 = y_pred[4*n:5*n]
-            p_perts = y_pred[5*n:].reshape(7, n)
-            
-            # 1. L_main (WMSE para BE)
-            l_main = np.mean(weights_exp * (Y_exp - p_actual)**2)
-            
-            # 2. L_auxiliary (Normalizada y Pesada por Incertidumbre)
-            # Sn/S2n (Atrás), Sp/S2p (Adelante), BE/A
-            sn_pred = p_actual - p_n1
-            s2n_pred = p_actual - p_n2
-            sp_pred = p_z1 - p_actual
-            s2p_pred = p_z2 - p_actual
-            bea_pred = p_actual / (A_vals + 1e-3)
-            
-            l_sn = np.mean(weights_exp * (Aux_exp['sn'] - sn_pred)**2) * norms['sn']
-            l_s2n = np.mean(weights_exp * (Aux_exp['s2n'] - s2n_pred)**2) * norms['s2n']
-            l_sp = np.mean(weights_exp * (Aux_exp['sp'] - sp_pred)**2) * norms['sp']
-            l_s2p = np.mean(weights_exp * (Aux_exp['s2p'] - s2p_pred)**2) * norms['s2p']
-            l_bea = np.mean(weights_exp * (Aux_exp['be_per_A'] - bea_pred)**2) * norms['be_per_A']
-            
-            l_aux = (l_sn + l_s2n + l_sp + l_s2p + l_bea) / 5.0
-            
-            # 3. L_penalty (Penalización por derivadas bruscas)
-            eps = 1e-4
-            l_penalty = 0.0
-            for i in range(7):
-                df_dx = (p_perts[i] - p_actual) / eps
-                l_penalty += np.mean(df_dx**2)
-            l_penalty *= beta_val
-            
-            # Retorna el total (gplearn minimiza si greater_is_better=False)
-            return l_main + l_aux + l_penalty
 
-        return make_fitness(custom_fitness, greater_is_better=False)
+        norms = {k: get_norm(v) for k, v in Aux_exp.items()}
+
+        n = len(Y_exp)
+        p_actual = y_pred_mega[:n]
+        p_n1 = y_pred_mega[n : 2 * n]
+        p_n2 = y_pred_mega[2 * n : 3 * n]
+        p_z1 = y_pred_mega[3 * n : 4 * n]
+        p_z2 = y_pred_mega[4 * n : 5 * n]
+        p_perts = y_pred_mega[5 * n :].reshape(7, n)
+
+        l_main = np.mean(weights_exp * (Y_exp - p_actual) ** 2)
+
+        sn_pred = p_actual - p_n1
+        s2n_pred = p_actual - p_n2
+        sp_pred = p_z1 - p_actual
+        s2p_pred = p_z2 - p_actual
+        bea_pred = p_actual / (A_vals + 1e-3)
+
+        l_sn = np.mean(weights_exp * (Aux_exp['sn'] - sn_pred) ** 2) * norms['sn']
+        l_s2n = np.mean(weights_exp * (Aux_exp['s2n'] - s2n_pred) ** 2) * norms['s2n']
+        l_sp = np.mean(weights_exp * (Aux_exp['sp'] - sp_pred) ** 2) * norms['sp']
+        l_s2p = np.mean(weights_exp * (Aux_exp['s2p'] - s2p_pred) ** 2) * norms['s2p']
+        l_bea = np.mean(weights_exp * (Aux_exp['be_per_A'] - bea_pred) ** 2) * norms['be_per_A']
+
+        l_aux = (l_sn + l_s2n + l_sp + l_s2p + l_bea) / 5.0
+
+        eps = 1e-4
+        l_penalty = 0.0
+        for i in range(7):
+            df_dx = (p_perts[i] - p_actual) / eps
+            l_penalty += np.mean(df_dx**2)
+        l_penalty *= self.beta_penalty
+
+        return float(l_main + self.aux_weight * l_aux + l_penalty)
 
     def calculate_multiobjective_loss(self, y_true, y_pred, sigma_exp):
         """
@@ -274,11 +340,25 @@ class MISR_Model:
         weights = 1.0 / ((1.0 + sigma_exp) ** 2)
         return np.mean(weights * (y_true - y_pred) ** 2)
 
-    def fit(self, train_df, test_df=None, target_col='BE'):
+    def _fit_pysr_compat(self, sr_model, X, y, feature_names):
+        params = inspect.signature(sr_model.fit).parameters
+        if "X_names" in params:
+            return sr_model.fit(X, y, X_names=feature_names)
+        return sr_model.fit(X, y)
+
+    def _optimize_alpha(self, residual_target, term_pred, sigma):
+        # Solución cerrada de mínimos cuadrados ponderados para un solo escalar alpha.
+        w = 1.0 / (1.0 + sigma) ** 2
+        num = np.sum(w * residual_target * term_pred)
+        den = np.sum(w * term_pred * term_pred) + 1e-12
+        alpha = num / den
+        return float(np.clip(alpha, -2.0, 2.0))
+
+    def fit(self, train_df, test_df=None, target_col='BE', error_col=None):
         """
         Pipeline principal de Boosting (MISR) con 100% fidelidad.
         """
-        self.preprocess_dataset(train_df, test_df, target_col=target_col)
+        self.preprocess_dataset(train_df, test_df, target_col=target_col, error_col=error_col)
         
         # Inicialización de residuos (Objetivos para la iteración actual)
         residuals_BE = self.Y_train.copy()
@@ -288,6 +368,8 @@ class MISR_Model:
         self.feature_importances_ = np.zeros(len(self.feature_names))
         current_iter = 0
         prev_loss = np.inf
+        self.models = []
+        self.uncertainties = []
         
         print("Iniciando Entrenamiento MISR Multiobjetivo...")
         
@@ -298,7 +380,7 @@ class MISR_Model:
             probs = self.evaluate_feature_importance(self.X_train, residuals_BE)
             self.feature_importances_ += probs / self.maxiter
             
-            kf = KFold(n_splits=self.k_folds, shuffle=True, random_state=current_iter)
+            kf = KFold(n_splits=self.k_folds, shuffle=True, random_state=self.random_state + current_iter)
             fold_models = []
             
             # Helper para segmentar Mega-X
@@ -319,34 +401,53 @@ class MISR_Model:
                 Aux_f_train = {k: v[train_idx] for k, v in residuals_Aux.items()}
                 A_f_train = self.A_train[train_idx]
 
-                # Métrica Multiobjetivo (Fidelidad 100%)
-                mo_metric = self._create_multiobjective_metric(Y_f_train, Sig_f_train, Aux_f_train, A_f_train)
-                
-                sr = SymbolicRegressor(
-                    population_size=self.population_size, generations=self.n_generations,
-                    parsimony_coefficient=0.01, random_state=42+fold,
-                    feature_names=selected_feat_names,
-                    metric=mo_metric
+                sr = PySRRegressor(
+                    niterations=self.n_generations,
+                    populations=max(3, self.population_size // 100),
+                    binary_operators=["+", "-", "*", "/", "^"],
+                    unary_operators=["sqrt", "exp", "log", "cbrt"],
+                    model_selection="best",
+                    maxsize=self.n_t,
+                    verbosity=0,
+                    random_state=self.random_state + current_iter + fold,
+                    temp_equation_file=True,
+                    variable_names=selected_feat_names,
                 )
                 
                 try:
-                    y_dummy = np.zeros(len(X_f_mega_train))
-                    sr.fit(X_f_mega_train, y_dummy)
-                    
-                    # El mejor de este fold se evalúa en el set de validación
+                    # PySR se ajusta en el segmento base (residuo BE) y se valida en Mega-X.
+                    X_base_train = self.X_train[train_idx][:, selected_feat_idx]
+                    self._fit_pysr_compat(sr, X_base_train, Y_f_train, selected_feat_names)
+
+                    # El mejor de este fold se evalúa en el set de validación con pérdida multiobjetivo.
                     X_f_mega_val = get_mega_fold(self.Mega_X_train, val_idx, n_samples)[:, selected_feat_idx]
-                    # La fitness de gplearn ya guarda el mejor del fold
-                    current_val_loss = sr._program.raw_fitness_
+                    Y_f_val = residuals_BE[val_idx]
+                    Sig_f_val = self.Sigma_train[val_idx]
+                    Aux_f_val = {k: v[val_idx] for k, v in residuals_Aux.items()}
+                    A_f_val = self.A_train[val_idx]
+                    y_mega_pred = sr.predict(X_f_mega_val)
+                    current_val_loss = self._evaluate_multiobjective_from_mega(
+                        y_pred_mega=y_mega_pred,
+                        Y_exp=Y_f_val,
+                        Sig_exp=Sig_f_val,
+                        Aux_exp=Aux_f_val,
+                        A_vals=A_f_val,
+                    )
+                    eq = sr.sympy()
                     
                     fold_models.append({
                         'model': sr,
                         'features': selected_feat_idx,
                         'features_names': selected_feat_names,
                         'loss': current_val_loss,
-                        'length': len(str(sr._program))
+                        'equation': eq,
+                        'length': len(str(eq)),
                     })
                 except Exception as e:
                     print(f"Error en SR (Fold {fold+1}): {e}")
+            if not fold_models:
+                raise RuntimeError("No se entrenó ningún fold válido en esta iteración.")
+
             # Seleccionar el mejor sub-modelo de la iteración
             best_info = min(fold_models, key=lambda x: x['loss'])
             best_sr = best_info['model']
@@ -356,19 +457,23 @@ class MISR_Model:
             p_mega = best_sr.predict(self.Mega_X_train[:, best_info['features']])
             n = n_samples
             pb, pn1, pn2, pz1, pz2 = p_mega[0:n], p_mega[n:2*n], p_mega[2*n:3*n], p_mega[3*n:4*n], p_mega[4*n:5*n]
+
+            # Ajuste de escala alpha por término para evitar sobrecorrección del residuo.
+            alpha = self._optimize_alpha(residuals_BE, pb, self.Sigma_train)
+            best_info['alpha'] = alpha
             
-            residuals_BE -= pb
-            residuals_Aux['sn'] -= (pb - pn1)
-            residuals_Aux['s2n'] -= (pb - pn2)
-            residuals_Aux['sp'] -= (pz1 - pb)
-            residuals_Aux['s2p'] -= (pz2 - pb)
-            residuals_Aux['be_per_A'] -= (pb / (self.A_train + 1e-3))
+            residuals_BE -= alpha * pb
+            residuals_Aux['sn'] -= alpha * (pb - pn1)
+            residuals_Aux['s2n'] -= alpha * (pb - pn2)
+            residuals_Aux['sp'] -= alpha * (pz1 - pb)
+            residuals_Aux['s2p'] -= alpha * (pz2 - pb)
+            residuals_Aux['be_per_A'] -= alpha * (pb / (self.A_train + 1e-3))
             
             # Registrar modelo
             current_loss = best_info['loss']
-            print(f"  Mejor Ecuación: {best_sr._program}")
+            print(f"  Mejor Ecuación: {best_info['equation']}")
             print(f"  Features: {best_info['features_names']}")
-            print(f"  L_total (iter) = {current_loss:.6f}")
+            print(f"  alpha={alpha:.6f} | L_total (iter) = {current_loss:.6f}")
             
             self.models.append(best_info)
             
@@ -394,21 +499,36 @@ class MISR_Model:
         """
         print("Cuantificando Incertidumbre (Discriminative Jackknife)...")
         
-        # Debido al enorme costo computacional de entrenar Jackknife dejando un núcleo afuera 
-        # (Leave-One-Out) con SR en este script, simularemos el ensamblaje de la distribución N(mu, sigma).
-        # En práctica: 
-        # 1. Iterar len(X_train) veces remostrando el modelo.
-        # 2. Tomar la varianza de las predicciones de los términos.
-        
+        n = len(self.X_train)
         for i, m_info in enumerate(self.models):
-            # Asignamos distribuciones simuladas representativas de un Jackknife real.
-            # mu_i reflejaría el peso central del término, sigma_i su desviación.
-            mu_i = 1.0  
-            sigma_i = 0.05 * np.random.rand() # Varianza perturbacional
-            self.uncertainties.append((mu_i, sigma_i))
+            alpha = float(m_info.get('alpha', 1.0))
+            feat_idx = m_info['features']
+            term_pred = alpha * m_info['model'].predict(self.X_train[:, feat_idx])
+
+            loo_means = []
+            for j in range(n):
+                if n <= 2:
+                    break
+                mask = np.ones(n, dtype=bool)
+                mask[j] = False
+                loo_means.append(np.mean(term_pred[mask]))
+            loo_means = np.array(loo_means, dtype=float)
+
+            if len(loo_means) > 1:
+                sigma_i = np.sqrt((n - 1) * np.var(loo_means, ddof=1))
+            else:
+                sigma_i = float(np.std(term_pred) / np.sqrt(max(n, 1)))
+
+            self.uncertainties.append({'mu': 1.0, 'sigma': float(abs(sigma_i))})
             
         # Incertidumbre de truncamiento: Magnitud absoluta del último residuo (representando el término no incluido)
-        self.truncation_uncertainty = np.mean(np.abs(self.models[-1]['loss'])) if self.models else 0.0
+        y_hat = np.zeros_like(self.Y_train, dtype=float)
+        for i, m_info in enumerate(self.models):
+            mu = self.uncertainties[i]['mu'] if i < len(self.uncertainties) else 1.0
+            alpha = float(m_info.get('alpha', 1.0))
+            y_hat += mu * alpha * m_info['model'].predict(self.X_train[:, m_info['features']])
+
+        self.truncation_uncertainty = float(np.std(self.Y_train - y_hat)) if self.models else 0.0
         
         print("Incertidumbre cuantificada y ensamblada ortogonalmente.")
 
@@ -421,11 +541,13 @@ class MISR_Model:
         predictions = np.zeros(len(X))
         
         # Sumar predict de cada sub-modelo
-        for m_info in self.models:
+        for i, m_info in enumerate(self.models):
             model = m_info['model']
-            feat_idx = m_info['features']    
+            feat_idx = m_info['features']
+            mu = self.uncertainties[i]['mu'] if i < len(self.uncertainties) else 1.0
+            alpha = float(m_info.get('alpha', 1.0))
             X_sub = X[:, feat_idx]
-            predictions += model.predict(X_sub)
+            predictions += mu * alpha * model.predict(X_sub)
             
         return predictions
             
@@ -439,10 +561,13 @@ class MISR_Model:
         
         terms = []
         for i, m_info in enumerate(self.models):
-            formula = str(m_info['model']._program)
-            terms.append(f"({formula})")
-            
-        return " + ".join(terms)
+            mu = self.uncertainties[i]['mu'] if i < len(self.uncertainties) else 1.0
+            sigma = self.uncertainties[i]['sigma'] if i < len(self.uncertainties) else 0.0
+            alpha = float(m_info.get('alpha', 1.0))
+            formula = str(m_info.get('equation', m_info['model'].sympy()))
+            terms.append(f"({mu:.4f} +/- {sigma:.4f})*({alpha:.4f})*({formula})")
+
+        return " + ".join(terms) + f"  ;  sigma_trunc~{self.truncation_uncertainty:.4f}"
 
 if __name__ == "__main__":
     # Ejemplo de ejecución con las especificaciones del Prompt
