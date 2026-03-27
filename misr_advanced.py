@@ -228,6 +228,10 @@ class MISR_Model:
         def custom_fitness(y, y_pred, w):
             # y_pred viene de evaluar el programa sobre Mega_X (12 * n muestras)
             n = len(Y_exp)
+            if len(y_pred) < 12 * n:
+                # gplearn hace un chequeo de sanidad pasándole un array de tamaño 2
+                return 0.0
+            
             p_actual = y_pred[:n]
             p_n1 = y_pred[n:2*n]
             p_n2 = y_pred[2*n:3*n]
@@ -265,7 +269,7 @@ class MISR_Model:
             # Retorna el total (gplearn minimiza si greater_is_better=False)
             return l_main + l_aux + l_penalty
 
-        return make_fitness(custom_fitness, greater_is_better=False)
+        return make_fitness(function=custom_fitness, greater_is_better=False)
 
     def calculate_multiobjective_loss(self, y_true, y_pred, sigma_exp):
         """
@@ -335,8 +339,16 @@ class MISR_Model:
                     
                     # El mejor de este fold se evalúa en el set de validación
                     X_f_mega_val = get_mega_fold(self.Mega_X_train, val_idx, n_samples)[:, selected_feat_idx]
-                    # La fitness de gplearn ya guarda el mejor del fold
-                    current_val_loss = sr._program.raw_fitness_
+                    y_pred_val = sr.predict(X_f_mega_val)
+                    
+                    Y_f_val = residuals_BE[val_idx]
+                    Sig_f_val = self.Sigma_train[val_idx]
+                    Aux_f_val = {k: v[val_idx] for k, v in residuals_Aux.items()}
+                    A_f_val = self.A_train[val_idx]
+                    
+                    val_metric = self._create_multiobjective_metric(Y_f_val, Sig_f_val, Aux_f_val, A_f_val)
+                    y_dummy_val = np.zeros(len(X_f_mega_val))
+                    current_val_loss = val_metric(y_dummy_val, y_pred_val, None)
                     
                     fold_models.append({
                         'model': sr,
