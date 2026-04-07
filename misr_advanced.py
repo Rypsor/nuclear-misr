@@ -359,8 +359,34 @@ class MISR_Model:
                     })
                 except Exception as e:
                     print(f"Error en SR (Fold {fold+1}): {e}")
-            # Seleccionar el mejor sub-modelo de la iteración
-            best_info = min(fold_models, key=lambda x: x['loss'])
+            # Seleccionar el mejor sub-modelo usando la Frontera de Pareto (Equilibrio Precisión vs Simplicidad)
+            pareto_frontier = []
+            for m1 in fold_models:
+                dominated = False
+                for m2 in fold_models:
+                    if m1 is m2: continue
+                    # m2 domina a m1 si es mejor o igual en ambos, y estrictamente mejor en al menos uno
+                    if (m2['loss'] <= m1['loss'] and m2['length'] <= m1['length']) and \
+                       (m2['loss'] < m1['loss'] or m2['length'] < m1['length']):
+                        dominated = True
+                        break
+                if not dominated:
+                    pareto_frontier.append(m1)
+            
+            # De la frontera, seleccionamos el que minimiza la distancia al origen ideal normalizado
+            if len(pareto_frontier) == 1:
+                best_info = pareto_frontier[0]
+            else:
+                min_loss, max_loss = min(m['loss'] for m in pareto_frontier), max(m['loss'] for m in pareto_frontier)
+                min_len, max_len = min(m['length'] for m in pareto_frontier), max(m['length'] for m in pareto_frontier)
+                
+                def pareto_score(m):
+                    n_loss = (m['loss'] - min_loss) / (max_loss - min_loss + 1e-9)
+                    n_len = (m['length'] - min_len) / (max_len - min_len + 1e-9)
+                    return np.sqrt(n_loss**2 + n_len**2)
+                    
+                best_info = min(pareto_frontier, key=pareto_score)
+                
             best_sr = best_info['model']
             
             # Actualizar RESIDUOS para BE y Auxiliares para la siguiente iteración
